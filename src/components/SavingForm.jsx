@@ -1,16 +1,12 @@
-import { useState, useEffect } from "react";
+import { useState } from "react";
+import { getRecommendations } from "../api/financeApi";
 
 const FIELD = {
-  width: "100%", padding: "10px 12px",
-  borderRadius: "8px",
-  border: "1px solid #d1d5db",
-  background: "#ffffff", color: "#111827",
-  fontSize: 15, boxSizing: "border-box",
+  width: "100%", padding: "10px 12px", borderRadius: "8px",
+  border: "1px solid #d1d5db", background: "#ffffff",
+  color: "#111827", fontSize: 15, boxSizing: "border-box",
 };
-const LABEL = {
-  display: "block", fontSize: 13, fontWeight: 500,
-  color: "#6b7280", marginBottom: 6
-};
+const LABEL = { display: "block", fontSize: 13, fontWeight: 500, color: "#6b7280", marginBottom: 6 };
 const TERMS  = [
   { label: "6개월", val: "6" }, { label: "12개월", val: "12" },
   { label: "24개월", val: "24" }, { label: "36개월", val: "36" },
@@ -19,59 +15,24 @@ const TERMS  = [
 const TYPES = ["정기예금", "적금", "청년도약계좌"];
 
 export default function SavingForm({ onSubmit, loading }) {
+  const [step, setStep] = useState(1);   // 1: 기본정보 / 2: 상품선택 / 3: 결과
   const [form, setForm] = useState({
     age: "", annualIncome: "", monthlyDeposit: "",
     termMonths: "12", productTypes: ["적금", "청년도약계좌"],
+    portfolioMode: false,
   });
-
-  // 포트폴리오 배분 금액 (상품별)
-  const [allocation, setAllocation] = useState({});
-  // 포트폴리오 모드 여부
-  const [portfolioMode, setPortfolioMode] = useState(false);
+  const [allocation, setAllocation]       = useState({});
+  const [candidates, setCandidates]       = useState(null);  // 2단계 추천 후보
+  const [selectedProducts, setSelected]   = useState({});    // 2단계 선택 결과
+  const [step2Loading, setStep2Loading]   = useState(false);
 
   const set = (k, v) => setForm(f => ({ ...f, [k]: v }));
-
-  const toggle = (t) => {
-    const next = form.productTypes.includes(t)
-      ? form.productTypes.filter(x => x !== t)
-      : [...form.productTypes, t];
-    setForm(f => ({ ...f, productTypes: next }));
-    // 상품 제거 시 배분 금액도 제거
-    if (form.productTypes.includes(t)) {
-      setAllocation(a => { const n = {...a}; delete n[t]; return n; });
-    }
-  };
-
-  // 총 납입 가능 금액 변경 시 청년도약계좌 자동 배분
-  useEffect(() => {
-    if (!portfolioMode) return;
-    const total = Number(form.monthlyDeposit.replace(/,/g, ""));
-    if (!total) return;
-
-    const age    = Number(form.age);
-    const income = Number(form.annualIncome.replace(/,/g, ""));
-    const youthOk = age >= 19 && age <= 34 && income <= 75_000_000;
-
-    if (youthOk && form.productTypes.includes("청년도약계좌")) {
-      const youthAmount = Math.min(total, 700_000);
-      const remaining   = total - youthAmount;
-      const newAlloc    = { "청년도약계좌": youthAmount };
-
-      // 나머지 상품들에 균등 배분
-      const otherTypes = form.productTypes.filter(t => t !== "청년도약계좌");
-      if (otherTypes.length > 0 && remaining > 0) {
-        const perType = Math.floor(remaining / otherTypes.length);
-        otherTypes.forEach(t => { newAlloc[t] = perType; });
-      }
-      setAllocation(newAlloc);
-    }
-  }, [form.monthlyDeposit, form.age, form.annualIncome, portfolioMode, form.productTypes]);
-
-  // 배분 금액 합계
-  const totalAllocated = Object.values(allocation).reduce((s, v) => s + (v || 0), 0);
-  const totalBudget    = Number(form.monthlyDeposit.replace(/,/g, "")) || 0;
-  const isOver         = totalAllocated > totalBudget;
-  const isUnder        = totalAllocated < totalBudget;
+  const toggle = (t) => setForm(f => ({
+    ...f,
+    productTypes: f.productTypes.includes(t)
+      ? f.productTypes.filter(x => x !== t)
+      : [...f.productTypes, t],
+  }));
 
   const termChip = (active) => ({
     padding: "7px 16px", borderRadius: "8px",
@@ -80,7 +41,6 @@ export default function SavingForm({ onSubmit, loading }) {
     color: active ? "#1d4ed8" : "#6b7280",
     fontWeight: active ? 600 : 400, cursor: "pointer", fontSize: 13,
   });
-
   const typeChip = (active) => ({
     padding: "7px 16px", borderRadius: "8px",
     border: active ? "2px solid #16a34a" : "1px solid #d1d5db",
@@ -89,27 +49,119 @@ export default function SavingForm({ onSubmit, loading }) {
     fontWeight: active ? 600 : 400, cursor: "pointer", fontSize: 13,
   });
 
-  const handleSubmit = (e) => {
-    e.preventDefault();
-    if (portfolioMode && isOver) {
-      alert("배분 합계가 월 납입 가능 금액을 초과했습니다.");
-      return;
+  const totalBudget    = Number(form.monthlyDeposit.replace(/,/g, "")) || 0;
+  const totalAllocated = Object.values(allocation).reduce((s, v) => s + (Number(v) || 0), 0);
+  const isOver         = totalAllocated > totalBudget;
+
+  // ── 1단계 → 2단계: 후보 상품 조회 ──────────────────────────
+  const goToStep2 = async () => {
+    setStep2Loading(true);
+
+    // 포트폴리오 모드: 청년도약계좌 자동 70만원 배분
+    const age    = Number(form.age);
+    const income = Number(form.annualIncome.replace(/,/g, ""));
+    const total  = Number(form.monthlyDeposit.replace(/,/g, ""));
+    const youthOk = age >= 19 && age <= 34 && income <= 75_000_000;
+
+    const newAlloc = {};
+    if (youthOk && form.productTypes.includes("청년도약계좌")) {
+      newAlloc["청년도약계좌"] = Math.min(total, 700_000);
+      const remaining  = total - newAlloc["청년도약계좌"];
+      const otherTypes = form.productTypes.filter(t => t !== "청년도약계좌");
+      if (otherTypes.length > 0 && remaining > 0) {
+        const perType = Math.floor(remaining / otherTypes.length);
+        otherTypes.forEach(t => { newAlloc[t] = perType; });
+      }
+    } else {
+      form.productTypes.forEach(t => { newAlloc[t] = Math.floor(total / form.productTypes.length); });
     }
+    setAllocation(newAlloc);
+
+    // 후보 상품 조회 (선택 없이 전체 추천)
+    try {
+      const data = await getRecommendations({
+        age:            Number(form.age),
+        annualIncome:   Number(form.annualIncome.replace(/,/g, "")),
+        monthlyDeposit: total,
+        termMonths:     Number(form.termMonths),
+        productTypes:   form.productTypes,
+        portfolioMode:  true,
+        allocation:     newAlloc,
+        purpose:        "저축",
+      });
+      setCandidates(data.results);
+      setStep(2);
+    } catch {
+      alert("추천 상품을 불러오지 못했습니다.");
+    } finally {
+      setStep2Loading(false);
+    }
+  };
+
+  // ── 2단계 → 3단계: 선택한 상품으로 최종 시뮬레이션 ──────────
+  const goToStep3 = () => {
+    onSubmit({
+      age:             Number(form.age),
+      annualIncome:    Number(form.annualIncome.replace(/,/g, "")),
+      monthlyDeposit:  Number(form.monthlyDeposit.replace(/,/g, "")),
+      termMonths:      Number(form.termMonths),
+      productTypes:    form.productTypes,
+      portfolioMode:   true,
+      allocation,
+      selectedProducts,
+      purpose:         "저축",
+    });
+  };
+
+  // ── 일반 모드 바로 제출 ────────────────────────────────────
+  const handleNormalSubmit = (e) => {
+    e.preventDefault();
     onSubmit({
       age:            Number(form.age),
       annualIncome:   Number(form.annualIncome.replace(/,/g, "")),
       monthlyDeposit: Number(form.monthlyDeposit.replace(/,/g, "")),
       termMonths:     Number(form.termMonths),
       productTypes:   form.productTypes,
-      allocation:     portfolioMode ? allocation : null,
+      portfolioMode:  false,
+      purpose:        "저축",
     });
   };
 
-  return (
-    <form onSubmit={handleSubmit} style={{
-      background: "#f9fafb", border: "1px solid #e5e7eb",
-      borderRadius: "12px", padding: 24, marginBottom: 32,
-    }}>
+  // ── 상품 카드 (2단계에서 라디오 선택) ─────────────────────
+  const ProductCard = ({ item }) => {
+    const key      = item.category;
+    const id       = item.category === "자산형성" ? item.institution : item.finPrdtCd;
+    const isSelected = selectedProducts[key] === id;
+
+    return (
+      <div onClick={() => setSelected(s => ({ ...s, [key]: id }))}
+        style={{
+          display: "flex", alignItems: "center", justifyContent: "space-between",
+          padding: "10px 14px", borderRadius: "8px", cursor: "pointer",
+          marginBottom: 8,
+          border: isSelected ? "1.5px solid #2563eb" : "0.5px solid #e5e7eb",
+          background: isSelected ? "#eff6ff" : "#f9fafb",
+        }}>
+        <div>
+          <div style={{ fontSize: 13, fontWeight: 500, color: "#111827" }}>{item.productName}</div>
+          <div style={{ fontSize: 12, color: isSelected ? "#2563eb" : "#9ca3af" }}>
+            기본 {item.baseRate}% / 최고 {item.bestRate}%
+          </div>
+        </div>
+        <div style={{
+          width: 18, height: 18, borderRadius: "50%", flexShrink: 0,
+          border: isSelected ? "5px solid #2563eb" : "1.5px solid #d1d5db",
+          background: "#ffffff",
+        }} />
+      </div>
+    );
+  };
+
+  // ── 1단계 화면 ──────────────────────────────────────────────
+  if (step === 1) return (
+    <form onSubmit={form.portfolioMode ? (e) => { e.preventDefault(); goToStep2(); } : handleNormalSubmit}
+      style={{ background: "#f9fafb", border: "1px solid #e5e7eb", borderRadius: "12px", padding: 24, marginBottom: 32 }}>
+
       {/* 기본 정보 */}
       <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 16, marginBottom: 20 }}>
         <div>
@@ -134,8 +186,9 @@ export default function SavingForm({ onSubmit, loading }) {
         <label style={LABEL}>희망 저축 기간</label>
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
           {TERMS.map(({ label, val }) => (
-            <button key={val} type="button" onClick={() => set("termMonths", val)}
-              style={termChip(form.termMonths === val)}>{label}</button>
+            <button key={val} type="button" onClick={() => set("termMonths", val)} style={termChip(form.termMonths === val)}>
+              {label}
+            </button>
           ))}
         </div>
       </div>
@@ -145,95 +198,158 @@ export default function SavingForm({ onSubmit, loading }) {
         <label style={LABEL}>관심 상품 (복수 선택)</label>
         <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
           {TYPES.map(t => (
-            <button key={t} type="button" onClick={() => toggle(t)}
-              style={typeChip(form.productTypes.includes(t))}>{t}</button>
+            <button key={t} type="button" onClick={() => toggle(t)} style={typeChip(form.productTypes.includes(t))}>
+              {t}
+            </button>
           ))}
         </div>
       </div>
 
-      {/* 포트폴리오 모드 토글 */}
-      {form.productTypes.length >= 2 && (
-        <div style={{ marginBottom: 20 }}>
-          <button type="button"
-            onClick={() => setPortfolioMode(p => !p)}
-            style={{
-              padding: "8px 16px", borderRadius: "8px", cursor: "pointer",
-              border: portfolioMode ? "2px solid #7c3aed" : "1px solid #d1d5db",
-              background: portfolioMode ? "#ede9fe" : "#ffffff",
-              color: portfolioMode ? "#6d28d9" : "#6b7280",
-              fontWeight: portfolioMode ? 600 : 400, fontSize: 13,
-            }}>
-            {portfolioMode ? "✅ 포트폴리오 모드 ON" : "💼 포트폴리오 모드로 금액 배분하기"}
-          </button>
-        </div>
-      )}
+      {/* 투자 방식 선택 */}
+      <div style={{ marginBottom: 24 }}>
+        <label style={LABEL}>투자 방식</label>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
 
-      {/* 포트폴리오 배분 UI */}
-      {portfolioMode && form.productTypes.length >= 2 && (
-        <div style={{
-          background: "#ffffff", border: "1px solid #e5e7eb",
-          borderRadius: "8px", padding: 16, marginBottom: 20,
-        }}>
-          <div style={{ fontSize: 13, fontWeight: 500, color: "#374151", marginBottom: 12 }}>
-            💼 상품별 월 납입 금액 배분
-          </div>
-
-          {form.productTypes.map(type => (
-            <div key={type} style={{
-              display: "flex", alignItems: "center", gap: 12, marginBottom: 10,
-            }}>
-              <div style={{
-                width: 120, fontSize: 13, fontWeight: 500,
-                color: type === "청년도약계좌" ? "#6d28d9" : "#374151",
-              }}>
-                {type}
-                {type === "청년도약계좌" && (
-                  <div style={{ fontSize: 11, color: "#9ca3af" }}>최대 70만원</div>
-                )}
-              </div>
-              <input
-                type="number"
-                min="0"
-                max={type === "청년도약계좌" ? 700000 : undefined}
-                placeholder="0"
-                value={allocation[type] || ""}
-                onChange={e => setAllocation(a => ({
-                  ...a, [type]: Number(e.target.value)
-                }))}
-                style={{ ...FIELD, width: 160 }}
-              />
-              <span style={{ fontSize: 13, color: "#6b7280" }}>원</span>
-            </div>
-          ))}
-
-          {/* 합계 표시 */}
-          <div style={{
-            marginTop: 12, paddingTop: 12,
-            borderTop: "1px solid #e5e7eb",
-            display: "flex", justifyContent: "space-between", alignItems: "center",
+          {/* 일반 모드 */}
+          <div onClick={() => set("portfolioMode", false)} style={{
+            display: "flex", alignItems: "center", gap: 12, padding: "12px 14px",
+            borderRadius: "8px", cursor: "pointer",
+            border: !form.portfolioMode ? "1.5px solid #111827" : "0.5px solid #d1d5db",
+            background: !form.portfolioMode ? "#f3f4f6" : "#ffffff",
           }}>
-            <span style={{ fontSize: 13, color: "#6b7280" }}>배분 합계</span>
-            <span style={{
-              fontSize: 15, fontWeight: 600,
-              color: isOver ? "#dc2626" : isUnder ? "#d97706" : "#16a34a",
-            }}>
-              {totalAllocated.toLocaleString()}원 / {totalBudget.toLocaleString()}원
-              {isOver  && " ⚠️ 초과"}
-              {isUnder && ` (${(totalBudget - totalAllocated).toLocaleString()}원 미배분)`}
-              {!isOver && !isUnder && totalBudget > 0 && " ✅"}
-            </span>
+            <div style={{
+              width: 18, height: 18, borderRadius: "50%", flexShrink: 0,
+              border: !form.portfolioMode ? "5px solid #111827" : "1.5px solid #d1d5db",
+              background: "#ffffff",
+            }} />
+            <div>
+              <div style={{ fontSize: 13, fontWeight: 500, color: "#111827" }}>일반 모드</div>
+              <div style={{ fontSize: 11, color: "#9ca3af", marginTop: 2 }}>월 납입 금액 전체로 상품 추천</div>
+            </div>
           </div>
-        </div>
-      )}
 
-      <button type="submit" disabled={loading} style={{
+          {/* 포트폴리오 모드 */}
+          <div onClick={() => set("portfolioMode", true)} style={{
+            display: "flex", alignItems: "center", gap: 12, padding: "12px 14px",
+            borderRadius: "8px", cursor: "pointer",
+            border: form.portfolioMode ? "1.5px solid #7c3aed" : "0.5px solid #d1d5db",
+            background: form.portfolioMode ? "#faf5ff" : "#ffffff",
+          }}>
+            <div style={{
+              width: 18, height: 18, borderRadius: "50%", flexShrink: 0,
+              border: form.portfolioMode ? "5px solid #7c3aed" : "1.5px solid #d1d5db",
+              background: "#ffffff",
+            }} />
+            <div>
+              <div style={{ fontSize: 13, fontWeight: 500, color: form.portfolioMode ? "#6d28d9" : "#6b7280" }}>
+                포트폴리오 모드
+              </div>
+              <div style={{ fontSize: 11, color: "#9ca3af", marginTop: 2 }}>
+                월 납입 금액을 여러 상품에 나눠서 투자
+              </div>
+            </div>
+          </div>
+
+        </div>
+      </div>
+
+      <button type="submit" disabled={loading || step2Loading} style={{
         width: "100%", padding: 12, border: "none", borderRadius: "8px",
-        background: loading ? "#9ca3af" : "#111827",
+        background: (loading || step2Loading) ? "#9ca3af" : "#111827",
         color: "#ffffff", fontSize: 15, fontWeight: 500,
-        cursor: loading ? "not-allowed" : "pointer",
+        cursor: (loading || step2Loading) ? "not-allowed" : "pointer",
       }}>
-        {loading ? "분석 중..." : portfolioMode ? "포트폴리오 시뮬레이션" : "저축 상품 추천받기"}
+        {step2Loading ? "상품 조회 중..." :
+         loading      ? "분석 중..." :
+         form.portfolioMode ? "다음 단계 →" : "저축 상품 추천받기"}
       </button>
     </form>
   );
+
+  // ── 2단계 화면 ──────────────────────────────────────────────
+  if (step === 2 && candidates) {
+    // 카테고리별로 후보 그룹핑
+    const groups = {};
+    candidates.forEach(item => {
+      if (!item.eligible) return;
+      const key = item.category;
+      if (!groups[key]) groups[key] = [];
+      groups[key].push(item);
+    });
+
+    const allSelected = form.productTypes.every(type => {
+      const matchKey = type === "청년도약계좌" ? "자산형성" : type;
+      return selectedProducts[matchKey] !== undefined;
+    });
+
+    return (
+      <div style={{ background: "#f9fafb", border: "1px solid #e5e7eb", borderRadius: "12px", padding: 24, marginBottom: 32 }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 20 }}>
+          <div style={{ width: 26, height: 26, borderRadius: "50%", background: "#dbeafe", color: "#1d4ed8", fontSize: 13, fontWeight: 500, display: "flex", alignItems: "center", justifyContent: "center" }}>2</div>
+          <div style={{ fontSize: 15, fontWeight: 500 }}>상품별 금액 배분 + 추천 상품 선택</div>
+        </div>
+
+        {Object.entries(groups).map(([category, items]) => {
+          const type = category === "자산형성" ? "청년도약계좌" : category;
+          const isYouth = category === "자산형성";
+          return (
+            <div key={category} style={{ marginBottom: 20 }}>
+              <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 8 }}>
+                <div style={{ fontSize: 13, fontWeight: 500, color: "#374151" }}>
+                  {type}
+                  {isYouth && <span style={{ fontSize: 11, color: "#9ca3af", marginLeft: 6 }}>최대 70만원</span>}
+                </div>
+                <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <span style={{ fontSize: 12, color: "#6b7280" }}>배분 금액:</span>
+                  <input type="number" min="0"
+                    max={isYouth ? 700000 : undefined}
+                    value={allocation[type] || ""}
+                    onChange={e => setAllocation(a => ({ ...a, [type]: Number(e.target.value) }))}
+                    style={{ ...FIELD, width: 130, padding: "6px 10px", fontSize: 13 }}
+                  />
+                  <span style={{ fontSize: 12, color: "#6b7280" }}>원</span>
+                </div>
+              </div>
+
+              {isYouth && (
+                <div style={{ fontSize: 11, color: "#d97706", background: "#fef3c7", padding: "6px 10px", borderRadius: "6px", marginBottom: 8 }}>
+                  ⚠️ 5년 만기 상품 · {form.termMonths}개월 납입 후 만기까지 유지 기준으로 계산
+                </div>
+              )}
+
+              {items.map((item, i) => <ProductCard key={i} item={item} />)}
+            </div>
+          );
+        })}
+
+        {/* 배분 합계 */}
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "10px 0", borderTop: "1px solid #e5e7eb", marginBottom: 16 }}>
+          <span style={{ fontSize: 13, color: "#6b7280" }}>배분 합계</span>
+          <span style={{ fontSize: 14, fontWeight: 600, color: isOver ? "#dc2626" : totalAllocated === totalBudget ? "#16a34a" : "#d97706" }}>
+            {totalAllocated.toLocaleString()}원 / {totalBudget.toLocaleString()}원
+            {isOver && " ⚠️ 초과"}
+            {!isOver && totalAllocated === totalBudget && " ✅"}
+            {!isOver && totalAllocated < totalBudget && ` (${(totalBudget - totalAllocated).toLocaleString()}원 미배분)`}
+          </span>
+        </div>
+
+        <div style={{ display: "flex", gap: 10 }}>
+          <button type="button" onClick={() => setStep(1)} style={{
+            flex: 1, padding: 12, border: "1px solid #d1d5db", borderRadius: "8px",
+            background: "#ffffff", fontSize: 15, fontWeight: 500, cursor: "pointer", color: "#374151",
+          }}>← 이전</button>
+          <button type="button" onClick={goToStep3} disabled={!allSelected || isOver || loading} style={{
+            flex: 2, padding: 12, border: "none", borderRadius: "8px",
+            background: (!allSelected || isOver || loading) ? "#9ca3af" : "#111827",
+            color: "#ffffff", fontSize: 15, fontWeight: 500,
+            cursor: (!allSelected || isOver || loading) ? "not-allowed" : "pointer",
+          }}>
+            {loading ? "분석 중..." : "시뮬레이션 →"}
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  return null;
 }
